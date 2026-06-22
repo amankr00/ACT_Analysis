@@ -1,8 +1,8 @@
-const DEPLOYED_RENDER_URL = "https://act-analysis.onrender.com";
+// Local Backend URL (Use this when running the backend locally)
+// const API_BASE_URL = "http://127.0.0.1:8080";
 
-const API_BASE_URL = import.meta.env.DEV
-  ? "http://127.0.0.1:8080"
-  : DEPLOYED_RENDER_URL;
+// Deploy URL (Commented out)
+const API_BASE_URL = "https://act-analysis.onrender.com";
 
 export async function checkServerHealth() {
   try {

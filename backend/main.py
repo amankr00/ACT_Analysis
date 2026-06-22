@@ -136,100 +136,46 @@ STRICT REQUIREMENTS:
    Instead:
    - Identify the underlying legal issue(s).
    - Return the laws that govern those legal issues.
-   - Example:
-     Statement: "A landless agricultural laborer is being forcibly evicted from a homestead."
-     Legal Issues:
-     * Homestead rights
-     * Eviction
-     * Landless laborer protection
-     Return laws governing those issues even if the retrieved clauses discuss different facts.
 
-2. DO NOT summarize retrieved clauses.
+2. DO NOT summarize retrieved clauses or explain retrieval reasoning.
 
-3. DO NOT explain retrieval reasoning.
-
-4. DO NOT output:
-   - Confidence
-   - Match Type
-   - Ranking
-   - Search Process
-   - Legal Issue Extraction
-   - Notes
-   - Disclaimers
-   - "No direct match found"
-   - "Retrieved clauses are unrelated"
-   - Mentions of laws that are NOT applicable (e.g., "Act X is not applicable, instead...")
+3. DO NOT output:
+   - Confidence, Match Type, Ranking, Search Process, Legal Issue Extraction
+   - Notes, Disclaimers
+   - "No direct match found" or "Retrieved clauses are unrelated"
+   - Mentions of laws that are NOT applicable
    - Any chain-of-thought reasoning
 
-5. HALLUCINATION PREVENTION RULES:
-   - Never generate a law solely from legal intuition.
-   - Before returning a law, verify that:
-     * The law exists in the retrieved database OR
-     * The law is a well-established and widely recognized Indian/Bihar statute.
-   - If uncertain whether a law exists, exclude it.
+4. HALLUCINATION PREVENTION RULES:
+   - Before returning a law, verify that it exists in the retrieved database OR is a well-established Indian/Bihar statute.
+   - If uncertain whether a law exists, exclude it entirely.
    - Never create laws by combining legal concepts into Act names.
-     Examples of invalid outputs:
-     * Bihar Protection of Tenants from Eviction Act
-     * Bihar Restoration of Lands to Rural Laborers Act
-     * Bihar Privation of Land (Exemption from Ceiling) Act
-   - Return only laws that can be verified.
-   - If fewer than 5 verified laws exist, return fewer than 5 laws.
-   - Quality is more important than quantity.
-   - Do not attempt to fill empty slots with guessed laws.
-   - If retrieved clauses are unrelated, identify the legal issue and return only verified laws governing that issue.
-   - Before final output, perform a verification step for each proposed law:
-     * Does this Act actually exist?
-     * Is it applicable to Bihar or India?
-     * Does it govern the identified legal issue?
-     If any answer is uncertain, remove the law.
    - OUTPUT ONLY VERIFIED ACTS.
 
-6. If a section number is not explicitly present in retrieved materials or is uncertain, do NOT mention the section number.
+5. ABSOLUTE SILENCE ON REJECTIONS (CRITICAL):
+   - If a law is deemed inapplicable or fails verification, DO NOT print it.
+   - DO NOT print "(Removed as per Hallucination Prevention Rule)".
+   - DO NOT print "(Omitted)".
+   - DO NOT leave blank bullet points.
+   - Simply pretend the rejected law never existed. The user must only see the valid, applicable laws.
 
-7. Prefer Act names over section citations.
+6. If a section number is not explicitly present in retrieved materials or is uncertain, do NOT mention the section number. Prefer Act names over section citations.
 
-8. If retrieved clauses are unrelated:
-   - Ignore them.
-   - Identify the legal issue from the statement.
-   - Return the most relevant Bihar laws based on established legal knowledge.
+7. Return a maximum of 5 laws.
 
-9. Rank laws using:
-   - Same legal issue
-   - Same type of dispute
-   - Same category of parties
-   - Bihar-specific applicability
-
-10. Exclude laws that are only connected through keyword overlap.
-
-11. Never return pond laws, village common land laws, consolidation laws, or encroachment laws unless the user's statement actually concerns those issues.
-
-12. Return a maximum of 5 laws.
-
-13. Each law must contain only:
+8. Each law must contain only:
    - Law Name
-   - One short support statement (1–2 lines)
-
-CRITICAL OUTPUT RULES:
-The final answer MUST be strictly formatted as a simple list of applicable laws.
-You are FORBIDDEN from discussing rejected laws, search processes, or reasoning.
-If a law is not applicable, simply omit it from your response. Do not mention it at all.
-
-Before outputting each law perform validation:
-1. Does this law actually exist?
-2. Is this law applicable in Bihar or throughout India?
-3. Does this law govern the legal issue identified from the statement?
-4. Am I certain this law exists?
-If any answer is NO or UNCERTAIN: Omit the law silently.
+   - One short support statement explaining its relevance to the user's statement (1–2 lines)
 
 OUTPUT FORMAT:
 
 ### Relevant Bihar Laws
 
 • [Exact Law Name]
-  Support: [One short affirmative sentence explaining why it governs the issue.]
+  Support: [One short affirmative sentence explaining why this Act is relevant to the user's specific statement.]
 
 • [Exact Law Name]
-  Support: [One short affirmative sentence explaining why it governs the issue.]
+  Support: [One short affirmative sentence explaining why this Act is relevant to the user's specific statement.]
 
 RULES FOR OUTPUT:
 - You must output ONLY the "Relevant Bihar Laws" header and the bulleted list.
@@ -245,7 +191,7 @@ RULES FOR OUTPUT:
 
 {context}
 
-Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do not include any reasoning or mention inapplicable laws."""
+Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do not include any reasoning or mention inapplicable laws. If a law is not relevant, do not mention it at all."""
 
         completion = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -257,7 +203,21 @@ Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do no
             max_tokens=512,
         )
         raw_answer = completion.choices[0].message.content
-        return verify_citations(raw_answer, high_chunks + low_chunks)
+        
+        # Post-Processing: Forcefully remove any lines where the LLM hallucinated a "Removed" note
+        cleaned_lines = []
+        for line in raw_answer.split("\n"):
+            lower_line = line.lower()
+            if "(removed" not in lower_line and "(omitted" not in lower_line and "not applicable" not in lower_line:
+                cleaned_lines.append(line)
+                
+        cleaned_answer = "\n".join(cleaned_lines).strip()
+        
+        final_answer = verify_citations(cleaned_answer, high_chunks + low_chunks)
+        print("\n=== GENERATED AI RESPONSE ===")
+        print(final_answer)
+        print("=============================\n")
+        return final_answer
     except Exception as e:
         return f"Could not generate an answer via Groq. Error: {str(e)}"
 from core.embedder import embed_query
