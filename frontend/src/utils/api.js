@@ -1,4 +1,8 @@
-const API_BASE_URL = "http://127.0.0.1:8080";
+const DEPLOYED_RENDER_URL = "https://act-analysis.onrender.com";
+
+const API_BASE_URL = import.meta.env.DEV
+  ? "http://127.0.0.1:8080"
+  : DEPLOYED_RENDER_URL;
 
 export async function checkServerHealth() {
   try {

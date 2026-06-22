@@ -43,6 +43,7 @@ body {
   -moz-osx-font-smoothing: grayscale;
   line-height: 1.6;
   overflow-x: hidden;
+  zoom: 0.8; /* Make 100% resolution show like it is at 80% zoom */
 }
 
 /* App Shell Layout */
