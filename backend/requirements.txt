@@ -8,5 +8,5 @@ python-multipart
 tqdm
 numpy==1.26.4
 faiss-cpu
-groq
+ollama
 python-dotenv

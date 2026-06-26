@@ -1,13 +1,15 @@
 import os
 import re
 import shutil
+import time
+import threading
 import traceback
 import uuid
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -15,12 +17,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
+
 try:
-    from groq import Groq
-    groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    from ollama import Client
+    ollama_client = Client(host=OLLAMA_HOST)
 except Exception as e:
-    groq_client = None
-    print("Groq client initialization failed. Is GROQ_API_KEY set?", e)
+    ollama_client = None
+    print(f"Ollama client initialization failed. Is Ollama running at {OLLAMA_HOST}?", e)
+
+
+def _strip_think(text: str) -> str:
+    """Removes qwen3 <think>...</think> reasoning blocks that may leak into the output."""
+    if not text:
+        return text
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Handle an unterminated opening tag defensively.
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text.strip()
+
+
+def _ollama_chat(messages: List[Dict[str, str]], temperature: float = 0.0, max_tokens: int = 512) -> str:
+    """Calls the local Ollama model and returns the cleaned text content."""
+    response = ollama_client.chat(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        think=False,  # qwen3 is a reasoning model; disable chain-of-thought output
+        options={"temperature": temperature, "num_predict": max_tokens},
+    )
+    return _strip_think(response["message"]["content"])
 
 RELEVANCE_THRESHOLD = 0.50  # Cosine similarity threshold for "relevant" chunks
 
@@ -52,11 +78,10 @@ def verify_citations(answer: str, retrieved_chunks: list) -> str:
 
 def extract_issue_queries(statement: str) -> List[str]:
     """Uses LLM to extract multiple distinct legal issue queries from a user's statement for multi-query retrieval."""
-    if not groq_client:
+    if not ollama_client:
         return [statement]
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        content = _ollama_chat(
             messages=[
                 {"role": "system", "content": """You are a legal issue extractor. Given a user's legal situation, identify the distinct legal issues and output each as a short search query on a separate line.
 
@@ -78,7 +103,7 @@ land reform homestead tenancy"""},
             temperature=0.0,
             max_tokens=150,
         )
-        queries = [q.strip() for q in completion.choices[0].message.content.strip().split("\n") if q.strip()]
+        queries = [q.strip() for q in content.strip().split("\n") if q.strip()]
         return queries[:5] if queries else [statement]
     except Exception:
         return [statement]
@@ -110,8 +135,8 @@ def compute_confidence(high_relevance: List[Dict], all_results: List[Dict]) -> s
 
 
 def synthesize_answer(statement: str, high_chunks: List[Dict], low_chunks: List[Dict], confidence: str) -> str:
-    if not groq_client:
-        return "Groq API Key not found. Please set GROQ_API_KEY in the backend .env file to enable AI synthesis."
+    if not ollama_client:
+        return f"Ollama is not available. Ensure Ollama is running at {OLLAMA_HOST} and the '{OLLAMA_MODEL}' model is pulled to enable AI synthesis."
     
     if not high_chunks and not low_chunks:
         return "No clauses were found in the database for this statement."
@@ -193,8 +218,7 @@ RULES FOR OUTPUT:
 
 Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do not include any reasoning or mention inapplicable laws. If a law is not relevant, do not mention it at all."""
 
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        raw_answer = _ollama_chat(
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_prompt}
@@ -202,7 +226,6 @@ Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do no
             temperature=0.0,
             max_tokens=512,
         )
-        raw_answer = completion.choices[0].message.content
         
         # Post-Processing: Forcefully remove any lines where the LLM hallucinated a "Removed" note
         cleaned_lines = []
@@ -219,7 +242,7 @@ Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do no
         print("=============================\n")
         return final_answer
     except Exception as e:
-        return f"Could not generate an answer via Groq. Error: {str(e)}"
+        return f"Could not generate an answer via Ollama. Error: {str(e)}"
 from core.embedder import embed_query
 from core.faiss_act_store import load_index as load_act_index
 from core.faiss_act_store import search as act_search
@@ -283,6 +306,37 @@ def _json_error(message: str, status_code: int = 500) -> JSONResponse:
         content={"status": "error", "message": message},
     )
 
+# All public endpoints are served under this prefix (matches the Cloudflare tunnel route).
+router = APIRouter(prefix="/bihar-act")
+
+# === Async job store for long-running searches (polling pattern) ===
+# Keeps the request alive past the Cloudflare tunnel / proxy ~100s limit:
+# the client submits a job, then polls the status endpoint until it completes.
+JOB_TTL_SECONDS = 15 * 60  # jobs are retained for 15 minutes
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+def _purge_expired_jobs() -> None:
+    """Removes jobs older than JOB_TTL_SECONDS to keep the in-memory store bounded."""
+    now = time.time()
+    with _jobs_lock:
+        expired = [jid for jid, j in _jobs.items() if now - j.get("created_at", now) > JOB_TTL_SECONDS]
+        for jid in expired:
+            _jobs.pop(jid, None)
+
+def _run_act_search_job(job_id: str, combined_query: str) -> None:
+    """Background worker: runs the full act search and stores the result on the job."""
+    try:
+        result = _perform_act_search(combined_query)
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update(status="completed", result=result, updated_at=time.time())
+    except Exception as e:
+        traceback.print_exc()
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update(status="error", message=str(e), updated_at=time.time())
+
 @app.on_event("startup")
 def startup():
     print("Loading ACTS FAISS index...")
@@ -296,7 +350,7 @@ def startup():
 def root():
     return {"message": "Judicial AI Acts Backend is running"}
 
-@app.get("/judicialAI-health")
+@router.get("/health")
 async def health_check():
     return {
         "status": "ok",
@@ -304,97 +358,131 @@ async def health_check():
     }
 
 
-@app.post("/judicialAI/act/search")
-async def search_acts_by_statement(request: ActSearchQueryRequest):
-    try:
-        combined_query = request.statement.strip() if request.statement else ""
-        if not combined_query:
-            raise ValueError("Provide a statement for search query.")
-            
-        load_act_index()
-        
-        # === PASS 1: Search with original statement ===
-        query_embedding = embed_query(combined_query)
-        top_k = 15
-        results = act_search(query_embedding, k=top_k, include_scores=True)
-        
-        formatted_results = []
-        for item in results:
-            metadata = item.get("metadata", {})
-            formatted_results.append({
-                "text": item.get("text", ""),
-                "act_name": metadata.get("act_name", "Statutory Act"),
-                "document_name": metadata.get("document_name", "N/A"),
-                "filename": metadata.get("filename", "N/A"),
-                "pdf_path": metadata.get("pdf_path", "N/A"),
-                "page_num": metadata.get("page_num", "N/A"),
-                "chunk_index": metadata.get("chunk_index", "N/A"),
-                "faiss_score": round(float(item.get("vector_score", 0.0)), 4)
-            })
-        
-        # === RELEVANCE FILTERING ===
+def _perform_act_search(combined_query: str) -> dict:
+    """Runs the full two-stage act search + answer synthesis. Returns the response payload.
+
+    Raises on failure; callers (the background job runner) are responsible for
+    capturing the exception and surfacing it via the job status.
+    """
+    load_act_index()
+
+    # === PASS 1: Search with original statement ===
+    query_embedding = embed_query(combined_query)
+    top_k = 15
+    results = act_search(query_embedding, k=top_k, include_scores=True)
+
+    formatted_results = []
+    for item in results:
+        metadata = item.get("metadata", {})
+        formatted_results.append({
+            "text": item.get("text", ""),
+            "act_name": metadata.get("act_name", "Statutory Act"),
+            "document_name": metadata.get("document_name", "N/A"),
+            "filename": metadata.get("filename", "N/A"),
+            "pdf_path": metadata.get("pdf_path", "N/A"),
+            "page_num": metadata.get("page_num", "N/A"),
+            "chunk_index": metadata.get("chunk_index", "N/A"),
+            "faiss_score": round(float(item.get("vector_score", 0.0)), 4)
+        })
+
+    # === RELEVANCE FILTERING ===
+    high_relevance, low_relevance = filter_by_relevance(formatted_results)
+    confidence = compute_confidence(high_relevance, formatted_results)
+
+    # === STAGE 2: If low confidence, extract multiple legal issue queries and search again ===
+    issue_queries = None
+    if confidence == "LOW" and ollama_client:
+        issue_queries = extract_issue_queries(combined_query)
+        print(f"[STAGE 2] Issue queries: {issue_queries}")
+
+        existing_texts = {r["text"] for r in formatted_results}
+        for iq in issue_queries:
+            query_embedding_iq = embed_query(iq)
+            results_iq = act_search(query_embedding_iq, k=10, include_scores=True)
+
+            for item in results_iq:
+                text = item.get("text", "")
+                if text not in existing_texts:
+                    metadata = item.get("metadata", {})
+                    new_result = {
+                        "text": text,
+                        "act_name": metadata.get("act_name", "Statutory Act"),
+                        "document_name": metadata.get("document_name", "N/A"),
+                        "filename": metadata.get("filename", "N/A"),
+                        "pdf_path": metadata.get("pdf_path", "N/A"),
+                        "page_num": metadata.get("page_num", "N/A"),
+                        "chunk_index": metadata.get("chunk_index", "N/A"),
+                        "faiss_score": round(float(item.get("vector_score", 0.0)), 4)
+                    }
+                    formatted_results.append(new_result)
+                    existing_texts.add(text)
+
+        # Re-filter after multi-query merge
         high_relevance, low_relevance = filter_by_relevance(formatted_results)
         confidence = compute_confidence(high_relevance, formatted_results)
-        
-        # === STAGE 2: If low confidence, extract multiple legal issue queries and search again ===
-        issue_queries = None
-        if confidence == "LOW" and groq_client:
-            issue_queries = extract_issue_queries(combined_query)
-            print(f"[STAGE 2] Issue queries: {issue_queries}")
-            
-            existing_texts = {r["text"] for r in formatted_results}
-            for iq in issue_queries:
-                query_embedding_iq = embed_query(iq)
-                results_iq = act_search(query_embedding_iq, k=10, include_scores=True)
-                
-                for item in results_iq:
-                    text = item.get("text", "")
-                    if text not in existing_texts:
-                        metadata = item.get("metadata", {})
-                        new_result = {
-                            "text": text,
-                            "act_name": metadata.get("act_name", "Statutory Act"),
-                            "document_name": metadata.get("document_name", "N/A"),
-                            "filename": metadata.get("filename", "N/A"),
-                            "pdf_path": metadata.get("pdf_path", "N/A"),
-                            "page_num": metadata.get("page_num", "N/A"),
-                            "chunk_index": metadata.get("chunk_index", "N/A"),
-                            "faiss_score": round(float(item.get("vector_score", 0.0)), 4)
-                        }
-                        formatted_results.append(new_result)
-                        existing_texts.add(text)
-            
-            # Re-filter after multi-query merge
-            high_relevance, low_relevance = filter_by_relevance(formatted_results)
-            confidence = compute_confidence(high_relevance, formatted_results)
-            
-        # === SYNTHESIZE ANSWER ===
-        generated_answer = synthesize_answer(combined_query, high_relevance, low_relevance, confidence)
 
-        return _ok(
-            {
-                "query": combined_query,
-                "issue_queries": issue_queries,
-                "top_k": top_k,
-                "confidence": confidence,
-                "high_relevance_count": len(high_relevance),
-                "low_relevance_count": len(low_relevance),
-                "results": formatted_results,
-                "generated_answer": generated_answer
-            },
-            "Acts search completed successfully."
-        )
-    except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
+    # === SYNTHESIZE ANSWER ===
+    generated_answer = synthesize_answer(combined_query, high_relevance, low_relevance, confidence)
 
-@app.post("/judicialAI-act/search")
+    return {
+        "query": combined_query,
+        "issue_queries": issue_queries,
+        "top_k": top_k,
+        "confidence": confidence,
+        "high_relevance_count": len(high_relevance),
+        "low_relevance_count": len(low_relevance),
+        "results": formatted_results,
+        "generated_answer": generated_answer
+    }
+
+
+@router.post("/act/search")
+async def start_act_search(request: ActSearchQueryRequest):
+    """Submits a search job and returns a job_id immediately.
+
+    The client then polls GET /bihar-act/act/search/status/{job_id} until the
+    job completes. This keeps total latency from tripping the ~100s proxy limit.
+    """
+    combined_query = request.statement.strip() if request.statement else ""
+    if not combined_query:
+        return _json_error("Provide a statement for search query.", status_code=400)
+
+    _purge_expired_jobs()
+    job_id = str(uuid.uuid4())
+    now = time.time()
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "pending", "created_at": now, "updated_at": now}
+
+    threading.Thread(target=_run_act_search_job, args=(job_id, combined_query), daemon=True).start()
+
+    return {
+        "status": "pending",
+        "job_id": job_id,
+        "poll_url": f"/bihar-act/act/search/status/{job_id}",
+        "message": "Search started. Poll the status endpoint for results.",
+    }
+
+
+@router.get("/act/search/status/{job_id}")
+async def get_act_search_status(job_id: str):
+    """Returns the current status of a search job, including its result once completed."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        job = dict(job) if job else None
+
+    if not job:
+        return _json_error("Job not found or expired.", status_code=404)
+
+    if job["status"] == "completed":
+        return _ok(job["result"], "Acts search completed successfully.")
+    if job["status"] == "error":
+        return _json_error(job.get("message", "Search failed."))
+
+    # Still running.
+    return {"status": "pending", "job_id": job_id, "message": "Search in progress."}
+
+
+@router.post("/search")
 async def search_acts(request: ActSearchRequest):
     try:
         query = _clean_text(request.query)
@@ -433,7 +521,7 @@ async def search_acts(request: ActSearchRequest):
         traceback.print_exc()
         return _json_error(str(exc))
 
-@app.post("/judicialAI/ingest")
+@router.post("/ingest")
 async def trigger_ingestion():
     """
     Trigger ingestion of all PDF files in the data/output_batch directory.
@@ -452,6 +540,11 @@ async def trigger_ingestion():
         return _json_error(str(e))
 
 
+# Register all /bihar-act endpoints on the app.
+app.include_router(router)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=False)
+    port = int(os.environ.get("PORT", "5090"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
