@@ -244,6 +244,7 @@ Return the most relevant Bihar laws. Adhere strictly to the OUTPUT FORMAT. Do no
     except Exception as e:
         return f"Could not generate an answer via Ollama. Error: {str(e)}"
 from core.embedder import embed_query
+from core.reranker import rerank as rerank_chunks
 from core.faiss_act_store import load_index as load_act_index
 from core.faiss_act_store import search as act_search
 from core.faiss_act_store import get_total_chunks as get_act_total_chunks
